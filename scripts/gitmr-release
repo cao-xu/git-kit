@@ -1,0 +1,320 @@
+#!/bin/bash
+#
+# gitmr-release: Release MR Assistant (v2.0 - Open Source Edition)
+#
+# A specialized and safety-focused script for creating release Merge Requests
+# (e.g., from a 'develop' branch to a 'master' or 'main' branch).
+#
+# Core Features:
+# 1. Prioritizes project selection to generate accurate CI links.
+# 2. Enforces that the source branch is up-to-date.
+# 3. Provides interactive CI status checking with helpful links.
+# 4. Smart workflow control and error handling.
+# 5. Clear and consistent console output, compatible with various environments.
+#
+
+# --- Configuration Loader ---
+# Looks for .git-kit-config in the project root, then in the user's home directory.
+
+CONFIG_FILE_NAME=".git-kit-config"
+# Find the root of the git repository
+PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+CONFIG_FILE=""
+
+# Prioritize config file in the project root, then fallback to home directory
+if [[ -n "$PROJECT_ROOT" && -f "$PROJECT_ROOT/$CONFIG_FILE_NAME" ]]; then
+    CONFIG_FILE="$PROJECT_ROOT/$CONFIG_FILE_NAME"
+elif [[ -f "$HOME/$CONFIG_FILE_NAME" ]]; then
+    CONFIG_FILE="$HOME/$CONFIG_FILE_NAME"
+fi
+
+get_config_value() {
+    local key="$1"
+    if [[ -z "$CONFIG_FILE" ]]; then return; fi
+    # Simple parser for the INI-like format. Gets a single value.
+    grep -E "^\s*${key}\s*=" "$CONFIG_FILE" | sed -E "s/^\s*${key}\s*=\s*//;s/\"//g" | tr -d '\r' | head -n 1
+}
+
+get_config_array() {
+    local key="$1"
+    if [[ -z "$CONFIG_FILE" ]]; then return; fi
+    # Parses a multi-line array value like projects = (...)
+    awk "/^\s*${key}\s*=\s*\(/,/\)/" "$CONFIG_FILE" | grep -v -E "^\s*($|#|${key})" | sed -E 's/^\s*//;s/\s*$//;s/"//g'
+}
+
+# Function to load config specifically for gitmr-release
+load_gitmr_release_config() {
+    # Load optional task link
+    TASK_LINK=$(get_config_value "task_management_url")
+    # Load release branches with safe defaults
+    TARGET_BRANCH=$(get_config_value "release_target_branch")
+    SOURCE_BRANCH=$(get_config_value "release_source_branch")
+    TARGET_BRANCH=${TARGET_BRANCH:-"master"}
+    SOURCE_BRANCH=${SOURCE_BRANCH:-"develop"}
+    
+    # Load and parse projects into a format the script can use
+    # `declare -gA` makes the variable globally available within the script
+    declare -gA projects
+    # shellcheck disable=SC2207
+    ordered_project_names=($(get_config_array "projects" | cut -d'=' -f1))
+    
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local nickname
+            nickname=$(echo "$line" | cut -d'=' -f1)
+            local data
+            data=$(echo "$line" | cut -d'=' -f2) # "PROJECT_ID,GIT_REPO_PATH"
+            projects["$nickname"]="$data"
+        fi
+    done < <(get_config_array "projects")
+
+    if [ ${#ordered_project_names[@]} -eq 0 ]; then
+        echo "❌ Error: No projects defined in '.git-kit-config'." >&2
+        echo "Please define at least one project under the [projects] section." >&2
+        exit 1
+    fi
+}
+# --- End of Configuration Loader ---
+
+
+# --- Utility Functions ---
+
+print_status() {
+    local type="$1"
+    local message="$2"
+    local color_success=$(tput setaf 2)
+    local color_warning=$(tput setaf 3)
+    local color_error=$(tput setaf 1)
+    local color_info=$(tput setaf 4)
+    local color_step=$(tput setaf 6)
+    local color_check=$(tput setaf 5)
+    local color_link=$(tput setaf 81)
+    local color_reset=$(tput sgr0)
+
+    case "$type" in
+        "success") echo -e "${color_success}✅ $message${color_reset}" ;;
+        "warning") echo -e "${color_warning}⚠️  $message${color_reset}" ;;
+        "error")   echo -e "${color_error}❌ $message${color_reset}" ;;
+        "info")    echo -e "${color_info}ℹ️  $message${color_reset}" ;;
+        "step")    echo -e "${color_step}🔄 $message${color_reset}" ;;
+        "check")   echo -e "${color_check}🔍 $message${color_reset}" ;;
+        "link")    echo -e "${color_link}🔗 $message${color_reset}" ;;
+    esac
+}
+
+confirm_action() {
+    local prompt="$1"
+    local default="${2:-y}"
+    while true; do
+        if [[ "$default" == "y" ]]; then read -p "$prompt [Y/n]: " choice; choice=${choice:-y};
+        else read -p "$prompt [y/N]: " choice; choice=${choice:-n}; fi
+        case "$choice" in
+            [Yy]*) return 0 ;;
+            [Nn]*) return 1 ;;
+            *) echo "Please enter y(es) or n(o)." ;;
+        esac
+    done
+}
+
+check_git_repo() {
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        print_status "error" "Not a Git repository. Please run this script from within a project."
+        exit 1
+    fi
+}
+
+get_project_info() {
+    local project_name="$1"
+    local project_info="${projects[$project_name]}"
+    if [[ -z "$project_info" ]]; then
+        print_status "error" "Project '$project_name' not found in config file."
+        exit 1
+    fi
+    # Use global variables for repo_id and git_path so they are available outside this function
+    repo_id=$(echo "$project_info" | cut -d',' -f1)
+    git_path=$(echo "$project_info" | cut -d',' -f2)
+}
+
+verify_repo_match() {
+    local expected_git_path="$1"
+    local repo_url
+    repo_url=$(git config remote.origin.url 2>/dev/null)
+    
+    if [[ -z "$repo_url" ]]; then
+        print_status "error" "Could not get the remote 'origin' URL."
+        exit 1
+    fi
+    
+    # Intelligently extract the repo path from either SSH or HTTPS URL format
+    # This is the key change to remove the hardcoded domain
+    local actual_git_path
+    actual_git_path=$(echo "$repo_url" | sed -E 's/.*:([^\/]+\/[^.]+\.git$)/\1/; s/.*\/\/.*?\/(.*)/\1/' | sed 's/\.git$//')
+
+    if [[ "$actual_git_path" != "$expected_git_path" ]]; then
+        print_status "error" "Repository mismatch!"
+        print_status "info" "Current repo path: $actual_git_path"
+        print_status "info" "Expected project path: $expected_git_path"
+        print_status "info" "Please run this script from the correct project directory."
+        exit 1
+    fi
+    print_status "success" "Repository verified: $actual_git_path"
+}
+
+ensure_branch() {
+    local branch="$1"
+    local current_branch
+    current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+    if [[ "$current_branch" != "$branch" ]]; then
+        print_status "step" "Current branch is '$current_branch', need to switch to '$branch'."
+        if confirm_action "Switch to '$branch' branch?"; then
+            git checkout "$branch" || { print_status "error" "Could not switch to '$branch'."; exit 1; }
+            print_status "success" "Switched to '$branch' branch."
+        else
+            print_status "error" "Release operations must be performed from the '$branch' branch."
+            exit 1
+        fi
+    else
+        print_status "success" "Already on '$branch' branch."
+    fi
+}
+
+update_branch() {
+    local branch="$1"
+    print_status "step" "Updating '$branch' branch to the latest version..."
+    if ! git diff-index --quiet HEAD --; then
+        print_status "warning" "Uncommitted changes detected."
+        if confirm_action "Stash current changes and continue?"; then
+            git stash push -m "gitmr-release auto-stash on $(date)"
+            print_status "info" "Changes stashed. Use 'git stash pop' to restore them later."
+        else
+            print_status "error" "Please handle uncommitted changes first."
+            exit 1
+        fi
+    fi
+    print_status "step" "Pulling latest changes for '$branch' from remote..."
+    if git pull origin "$branch"; then
+        print_status "success" "'$branch' is now up-to-date."
+    else
+        print_status "error" "Failed to pull '$branch'. Check network or resolve conflicts."
+        exit 1
+    fi
+}
+
+check_ci_status() {
+    local branch="$1"
+    local git_path="$2"
+    
+    # Intelligently get the HTTPS base URL from the remote URL
+    local repo_url
+    repo_url=$(git config remote.origin.url)
+    local git_host_url
+    git_host_url=$(echo "$repo_url" | sed -n 's/git@\([^:]*\):.*/https:\/\/\1/p; s/\(https?:\/\/[^\/]*\).*/\1/p' | head -n 1)
+
+    echo -e "\n=================================================="
+    print_status "check" "CI/CD Pipeline Status Check"
+    echo -e "==================================================\n"
+    print_status "info" "Please verify the CI pipeline status for the '$branch' branch."
+    
+    # Generate dynamic CI and MR links
+    local branch_commits_url="${git_host_url}/${git_path}/-/commits/${branch}"
+    local mr_preview_url="${git_host_url}/${git_path}/-/merge_requests/new?source_branch=${branch}&target_branch=${TARGET_BRANCH}"
+    
+    print_status "info" "🔍 Use these links to check the CI status:"
+    echo ""
+    echo "   1️⃣  [Branch Commits] View CI status for all recent commits on '$branch':"
+    echo "       $branch_commits_url"
+    echo ""
+    echo "   2️⃣  [Release Scope] Preview the exact changes and CI status for this release:"
+    echo "       $mr_preview_url"
+    echo ""
+    
+    while true; do
+        echo "Please confirm the CI status for all commits in this release:"
+        echo "1) ✅ All relevant CI checks have passed. Proceed."
+        echo "2) ⏳ CI is still running. I need to wait."
+        echo "3) ❌ CI has failed. I need to fix it first."
+        echo "4) 🚪 Abort and exit script."
+        read -p "Enter your choice (1-4): " choice
+        
+        case "$choice" in
+            1) print_status "success" "CI status confirmed as passed. Continuing..."; return 0 ;;
+            2) print_status "warning" "It is highly recommended to wait for CI to complete."; if confirm_action "Force continue anyway? (Not Recommended)" "n"; then return 0; fi ;;
+            3) print_status "error" "Please fix the CI issues on the '$branch' branch, push the fix, and run this script again."; exit 1 ;;
+            4) print_status "info" "User aborted the process."; exit 0 ;;
+            *) print_status "warning" "Invalid option. Please try again." ;;
+        esac
+    done
+}
+
+url_encode() { echo -n "$1" | sed 's/\//%2F/g'; }
+
+# --- Main Flow ---
+main() {
+    echo -e "\n🚀 Welcome to the Release MR Assistant!"
+    echo "=================================================="
+    
+    # 1. Load config
+    load_gitmr_release_config
+    print_status "info" "This script will create a release MR from '$SOURCE_BRANCH' to '$TARGET_BRANCH'."
+    
+    # 2. Select Project
+    print_status "step" "Step 1/5: Select Release Project"
+    PS3="Enter the number for your project: "
+    select project_name in "${ordered_project_names[@]}"; do
+        if [[ -n "$project_name" ]]; then
+            get_project_info "$project_name"
+            print_status "success" "Project selected: $project_name"
+            break
+        else print_status "warning" "Invalid option."; fi
+    done
+    
+    # 3. Verify Environment
+    print_status "step" "Step 2/5: Verify Environment"
+    check_git_repo
+    verify_repo_match "$git_path"
+    
+    # 4. Manage Branch
+    print_status "step" "Step 3/5: Update Source Branch"
+    ensure_branch "$SOURCE_BRANCH"
+    update_branch "$SOURCE_BRANCH"
+    
+    # 5. Check CI Status
+    print_status "step" "Step 4/5: Check CI Pipeline Status"
+    check_ci_status "$SOURCE_BRANCH" "$git_path"
+    
+    # 6. Generate and Display Links
+    print_status "step" "Step 5/5: Generate Release Links"
+    local repo_url
+    repo_url=$(git config remote.origin.url)
+    local https_repo_path
+    https_repo_path=$(echo "$repo_url" | sed -e 's/git@\(.*\):/https:\/\/\1\//' -e 's/\.git$//')
+    
+    local source_branch_encoded
+    source_branch_encoded=$(url_encode "$SOURCE_BRANCH")
+    local target_branch_encoded
+    target_branch_encoded=$(url_encode "$TARGET_BRANCH")
+    
+    local mr_url="${https_repo_path}/-/merge_requests/new?sourceProjectId=${repo_id}&targetProjectId=${repo_id}&sourceBranch=${source_branch_encoded}&targetBranch=${target_branch_encoded}"
+    
+    echo -e "\n=================================================="
+    print_status "success" "Release MR is ready to be created!"
+    echo -e "==================================================\n"
+    
+    if [[ -n "$TASK_LINK" ]]; then
+        print_status "link" "Task/Story Link (for MR description):"
+        echo "   $TASK_LINK"
+    fi
+    
+    print_status "link" "Release MR Link (open this in your browser):"
+    echo "   $mr_url"
+    
+    echo -e "\n--------------------------------------------------"
+    print_status "info" "Next Steps:"
+    echo "1. Open the MR link above in your browser."
+    echo "2. Write a clear title (e.g., 'Release: v1.2.3 - New Feature X')."
+    echo "3. Add detailed release notes to the description."
+    echo "4. Assign reviewers and submit the Merge Request."
+    echo ""
+}
+
+main "$@"

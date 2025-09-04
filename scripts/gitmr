@@ -1,0 +1,194 @@
+#!/bin/bash
+#
+# gitmr: Merge Request Assistant (v4.0 - Open Source Edition)
+#
+# A script to automate the creation of Merge/Pull Requests.
+#
+# Core Features:
+# 1. Interactively select a project from a user-defined list.
+# 2. Interactively select a target branch.
+# 3. Automatically uses the current branch as the source.
+# 4. Intelligently converts SSH or HTTP Git remote URLs to a valid HTTPS MR link.
+# 5. Automatically URL-encodes branch names with special characters (e.g., 'feature/add-login').
+# 6. Smartly uses system clipboard and browser tools (pbcopy, xdg-open, etc.) for a seamless experience.
+#
+
+# --- Configuration Loader ---
+# Looks for .git-kit-config in the project root, then in the user's home directory.
+
+CONFIG_FILE_NAME=".git-kit-config"
+# Find the root of the git repository
+PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+CONFIG_FILE=""
+
+# Prioritize config file in the project root, then fallback to home directory
+if [[ -n "$PROJECT_ROOT" && -f "$PROJECT_ROOT/$CONFIG_FILE_NAME" ]]; then
+    CONFIG_FILE="$PROJECT_ROOT/$CONFIG_FILE_NAME"
+elif [[ -f "$HOME/$CONFIG_FILE_NAME" ]]; then
+    CONFIG_FILE="$HOME/$CONFIG_FILE_NAME"
+fi
+
+get_config_value() {
+    local key="$1"
+    if [[ -z "$CONFIG_FILE" ]]; then return; fi
+    # Simple parser for the INI-like format. Gets a single value.
+    grep -E "^\s*${key}\s*=" "$CONFIG_FILE" | sed -E "s/^\s*${key}\s*=\s*//;s/\"//g" | tr -d '\r' | head -n 1
+}
+
+get_config_array() {
+    local key="$1"
+    if [[ -z "$CONFIG_FILE" ]]; then return; fi
+    # Parses a multi-line array value like target_branches = (...)
+    awk "/^\s*${key}\s*=\s*\(/,/\)/" "$CONFIG_FILE" | grep -v -E "^\s*($|#|${key})" | sed -E 's/^\s*//;s/\s*$//;s/"//g'
+}
+
+# Function to load config specifically for gitmr
+load_gitmr_config() {
+    # Load optional task link
+    TASK_LINK=$(get_config_value "task_management_url")
+    
+    # Load target branches, with a fallback default list
+    # shellcheck disable=SC2207
+    target_branches=($(get_config_array "target_branches"))
+    if [ ${#target_branches[@]} -eq 0 ]; then
+        target_branches=("develop" "main" "master" "release")
+    fi
+    
+    # Load and parse projects into a format the script can use
+    # `declare -gA` makes the variable globally available within the script
+    declare -gA projects
+    # shellcheck disable=SC2207
+    ordered_project_names=($(get_config_array "projects" | cut -d'=' -f1))
+    
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local nickname
+            nickname=$(echo "$line" | cut -d'=' -f1)
+            local project_id
+            project_id=$(echo "$line" | cut -d'=' -f2 | cut -d',' -f1)
+            projects["$nickname"]="$project_id"
+        fi
+    done < <(get_config_array "projects")
+
+    if [ ${#ordered_project_names[@]} -eq 0 ]; then
+        echo "❌ Error: No projects defined in '.git-kit-config'." >&2
+        echo "Please define at least one project under the [projects] section." >&2
+        exit 1
+    fi
+}
+# --- End of Configuration Loader ---
+
+
+# --- Main Flow ---
+echo "🚀 Welcome to the Merge Request Assistant (v4.0 - Open Source Edition)!"
+echo "--------------------------------------------------"
+
+# --- [Step 1] Load Configuration ---
+load_gitmr_config
+
+# --- [Step 2] Interactively Select Project ---
+echo "🤔 Please select the project for this MR:"
+COLUMNS=1 # Force select menu into a single column
+PS3="Enter the number for your project: "
+select project_name in "${ordered_project_names[@]}"; do
+    if [[ -n "$project_name" ]]; then
+        repo_id=${projects[$project_name]}
+        echo "✅ Project Selected: $project_name (ID: $repo_id)"
+        break
+    else
+        echo "⚠️ Invalid option. Please try again."
+    fi
+done
+unset COLUMNS # Reset COLUMNS to its default
+echo "--------------------------------------------------"
+
+# --- [Step 3] Get Git Repository Info ---
+repo_url=$(git config remote.origin.url)
+if [ -z "$repo_url" ]; then
+    echo "❌ Error: Could not get the remote 'origin' URL from your Git config." >&2; exit 1;
+fi
+
+# Convert Git URL (SSH or HTTP) to a usable HTTPS Web URL
+# 1. Replaces 'git@host:' with 'https://host/'
+# 2. Removes trailing '.git' if it exists
+https_repo_path=$(echo "$repo_url" | sed -e 's/git@\(.*\):/https:\/\/\1\//' -e 's/\.git$//')
+
+current_branch_raw=$(git symbolic-ref --short HEAD)
+if [ -z "$current_branch_raw" ]; then
+    echo "❌ Error: Could not get the current branch name. Are you in a detached HEAD state?" >&2; exit 1;
+fi
+echo "✅ Source Branch: $current_branch_raw"
+
+# --- [Step 4] Interactively Select Target Branch ---
+echo "🤔 Please select the target branch for this MR:"
+COLUMNS=1
+PS3="Enter the number for your target branch: "
+select target_branch_raw in "${target_branches[@]}"; do
+    if [[ -n "$target_branch_raw" ]]; then
+        echo "✅ Target Branch: $target_branch_raw"
+        break
+    else
+        echo "⚠️ Invalid option. Please try again."
+    fi
+done
+unset COLUMNS
+echo "--------------------------------------------------"
+echo "⏳ Preparing MR link..."
+echo ""
+
+# URL-encode branch names (crucial for branches with slashes like 'feature/add-auth')
+# The 'g' flag ensures all occurrences of '/' are replaced.
+source_branch_encoded=$(echo -n "$current_branch_raw" | sed 's/\//%2F/g')
+target_branch_encoded=$(echo -n "$target_branch_raw" | sed 's/\//%2F/g')
+
+# --- [Step 5 & 6] Create Link and Provide Instructions ---
+
+# Assemble the final URL. This format is common for GitLab, Gitea, and similar platforms.
+# For GitHub, the URL structure is different, but this script is tailored for GitLab-like MRs.
+full_url="${https_repo_path}/-/merge_requests/new?sourceProjectId=${repo_id}&targetProjectId=${repo_id}&sourceBranch=${source_branch_encoded}&targetBranch=${target_branch_encoded}"
+
+# 1. Handle Task Management Link (e.g., Jira, Trello)
+# Only proceed if TASK_LINK was set in the config file.
+if [[ -n "$TASK_LINK" ]]; then
+    os_name=$(uname)
+    copy_cmd=""
+    # Detect the appropriate copy command for the OS
+    if [[ "$os_name" == "Darwin" ]] && command -v pbcopy &> /dev/null; then copy_cmd="pbcopy"; fi
+    if [[ "$os_name" == "Linux" ]]; then
+        if command -v xclip &> /dev/null; then copy_cmd="xclip -selection clipboard";
+        elif command -v wl-copy &> /dev/null; then copy_cmd="wl-copy"; fi
+    fi
+    # MINGW/CYGWIN (Git Bash on Windows)
+    if [[ "$os_name" == "MINGW"* || "$os_name" == "CYGWIN"* ]] && command -v clip &> /dev/null; then copy_cmd="clip"; fi
+
+    if [[ -n "$copy_cmd" ]]; then
+        echo -n "$TASK_LINK" | $copy_cmd
+        echo "✅ [Auto] Task link copied to clipboard! Paste it in the MR description."
+    else
+        echo "👉 [Manual] Please copy your task link:"
+        echo "   (To paste into the MR description)"
+        echo ""
+        echo "   $TASK_LINK"
+        echo ""
+    fi
+fi
+
+# 2. Handle the Merge Request Link
+open_cmd=""
+# Detect the appropriate command to open a URL in the browser
+if [[ "$os_name" == "Darwin" ]]; then open_cmd="open"; fi
+if [[ "$os_name" == "Linux" ]]; then open_cmd="xdg-open"; fi
+if [[ "$os_name" == "MINGW"* || "$os_name" == "CYGWIN"* ]]; then open_cmd="start"; fi
+
+if [[ -n "$open_cmd" ]] && command -v "$open_cmd" &> /dev/null; then
+    "$open_cmd" "$full_url"
+    echo "✅ [Auto] Opening the Merge Request page in your browser..."
+else
+    echo "👉 [Manual] Please copy and paste this URL into your browser:"
+    echo ""
+    echo "   $full_url"
+    echo ""
+fi
+
+echo "--------------------------------------------------"
+echo "🎉 Done!"

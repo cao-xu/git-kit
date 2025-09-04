@@ -1,0 +1,455 @@
+#!/bin/bash
+#
+# git-sync: Interactive Rebase & Push Assistant (v2.0 - Open Source Edition)
+#
+# Automates the daily development workflow of rebasing and pushing,
+# including a comprehensive guided conflict resolution process.
+#
+# Core Features:
+# 1. Automatically updates the base branch (e.g., develop).
+# 2. Performs a rebase operation on the current feature branch.
+# 3. Intelligently detects and guides the user through resolving rebase conflicts.
+# 4. Interactively waits for conflict resolution before continuing.
+# 5. [Optional] Checks the status of a specified submodule to prevent regressions.
+# 6. Safely and interactively performs a --force push.
+#
+
+# --- Configuration Loader ---
+# Looks for .git-kit-config in the project root, then in the user's home directory.
+
+CONFIG_FILE_NAME=".git-kit-config"
+PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+CONFIG_FILE=""
+
+if [[ -n "$PROJECT_ROOT" && -f "$PROJECT_ROOT/$CONFIG_FILE_NAME" ]]; then
+    CONFIG_FILE="$PROJECT_ROOT/$CONFIG_FILE_NAME"
+elif [[ -f "$HOME/$CONFIG_FILE_NAME" ]]; then
+    CONFIG_FILE="$HOME/$CONFIG_FILE_NAME"
+fi
+
+get_config_value() {
+    local key="$1"
+    if [[ -z "$CONFIG_FILE" ]]; then return; fi
+    # Simple parser for the INI-like format. Gets a single value.
+    grep -E "^\s*${key}\s*=" "$CONFIG_FILE" | sed -E "s/^\s*${key}\s*=\s*//;s/\"//g" | tr -d '\r' | head -n 1
+}
+
+# Load configurations for this script
+BASE_BRANCH=$(get_config_value "base_branch")
+SUBMODULE_PATH=$(get_config_value "submodule_path")
+SUBMODULE_CI_URL=$(get_config_value "submodule_ci_url")
+
+# Set defaults if not found in config file
+BASE_BRANCH=${BASE_BRANCH:-"develop"}
+
+# --- End of Configuration Loader ---
+
+
+# --- Utility Functions ---
+
+# Print status messages with colors
+print_status() {
+    local type="$1"
+    local message="$2"
+    # Using tput for better compatibility than raw escape codes
+    local color_success=$(tput setaf 2) # Green
+    local color_warning=$(tput setaf 3) # Yellow
+    local color_error=$(tput setaf 1)   # Red
+    local color_info=$(tput setaf 4)    # Blue
+    local color_step=$(tput setaf 6)    # Cyan
+    local color_check=$(tput setaf 5)   # Magenta
+    local color_link=$(tput setaf 81)   # A nice blue/purple
+    local color_conflict=$(tput setaf 1; tput bold) # Bold Red
+    local color_reset=$(tput sgr0)      # Reset
+
+    case "$type" in
+        "success") echo -e "${color_success}✅ $message${color_reset}" ;;
+        "warning") echo -e "${color_warning}⚠️  $message${color_reset}" ;;
+        "error")   echo -e "${color_error}❌ $message${color_reset}" ;;
+        "info")    echo -e "${color_info}ℹ️  $message${color_reset}" ;;
+        "step")    echo -e "${color_step}🔄 $message${color_reset}" ;;
+        "check")   echo -e "${color_check}🔍 $message${color_reset}" ;;
+        "link")    echo -e "${color_link}🔗 $message${color_reset}" ;;
+        "conflict") echo -e "${color_conflict}⚡ $message${color_reset}" ;;
+    esac
+}
+
+# Confirm user action
+confirm_action() {
+    local prompt="$1"
+    local default="${2:-y}"  # Default to 'y'
+    
+    while true; do
+        if [[ "$default" == "y" ]]; then
+            read -p "$prompt [Y/n]: " choice
+            choice=${choice:-y}
+        else
+            read -p "$prompt [y/N]: " choice
+            choice=${choice:-n}
+        fi
+        
+        case "$choice" in
+            [Yy]*) return 0 ;;
+            [Nn]*) return 1 ;;
+            *) echo "Please enter y(es) or n(o)." ;;
+        esac
+    done
+}
+
+# Check if inside a Git repository
+check_git_repo() {
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        print_status "error" "Not a Git repository. Please run this script from within a project."
+        exit 1
+    fi
+}
+
+# Check if a rebase is already in progress
+check_rebase_in_progress() {
+    if [[ -d ".git/rebase-merge" || -d ".git/rebase-apply" ]]; then
+        return 0  # Is in rebase
+    else
+        return 1  # Is NOT in rebase
+    fi
+}
+
+# Get current rebase status info
+get_rebase_status() {
+    local rebase_dir=""
+    if [[ -d ".git/rebase-merge" ]]; then
+        rebase_dir=".git/rebase-merge"
+    elif [[ -d ".git/rebase-apply" ]]; then
+        rebase_dir=".git/rebase-apply"
+    else
+        return 1
+    fi
+    
+    local current_step=""
+    local total_steps=""
+    
+    if [[ -f "$rebase_dir/msgnum" && -f "$rebase_dir/end" ]]; then
+        current_step=$(cat "$rebase_dir/msgnum")
+        total_steps=$(cat "$rebase_dir/end")
+        echo "Step $current_step of $total_steps"
+    fi
+}
+
+# Show a list of files with conflicts
+show_conflict_files() {
+    local conflict_files
+    conflict_files=$(git diff --name-only --diff-filter=U)
+    if [[ -n "$conflict_files" ]]; then
+        print_status "conflict" "The following files have conflicts:"
+        echo "$conflict_files" | while read -r file; do
+            echo "   📄 $file"
+        done
+        return 0 # Conflicts exist
+    else
+        return 1 # No conflicts
+    fi
+}
+
+# Interactive conflict resolution flow
+handle_rebase_conflicts() {
+    echo ""
+    echo "=================================================="
+    print_status "conflict" "Rebase Conflict Resolution Mode"
+    echo "=================================================="
+    
+    while true; do
+        local rebase_status
+        rebase_status=$(get_rebase_status)
+        if [[ -n "$rebase_status" ]]; then
+            print_status "info" "Current progress: $rebase_status"
+        fi
+        echo ""
+
+        if show_conflict_files; then
+            echo ""
+            echo "🔧 What would you like to do?"
+            echo "1) ✅ I have manually resolved all conflicts"
+            echo "2) 🔍 Show conflict details"
+            echo "3) 📖 Show conflict resolution guide"
+            echo "4) 🚫 Abort the rebase"
+            echo ""
+            
+            read -p "Please choose an option (1-4): " choice
+            
+            case "$choice" in
+                1)
+                    print_status "info" "Checking if all conflicts have been resolved and 'add'ed..."
+                    if git diff --name-only --diff-filter=U | read -r; then
+                        print_status "warning" "Unresolved (or not 'add'ed) conflicts remain. Please check again."
+                        continue
+                    fi
+
+                    print_status "success" "Conflicts resolved. Continuing rebase..."
+                    if git rebase --continue; then
+                        if ! check_rebase_in_progress; then
+                            print_status "success" "All rebase steps completed successfully!"
+                            return 0
+                        else
+                            print_status "info" "Continuing to the next step..."
+                            continue
+                        fi
+                    else
+                        print_status "error" "'git rebase --continue' failed. There might still be unresolved issues."
+                        continue
+                    fi
+                    ;;
+                2)
+                    echo ""
+                    print_status "check" "Conflict Details:"
+                    git status --short | grep "^UU" | while read -r status_file; do
+                        local file
+                        file=$(echo "$status_file" | cut -c4-)
+                        echo ""
+                        echo "📄 File: $file"
+                        echo "   Conflict Preview:"
+                        git diff "$file" | head -20
+                        echo "   ..."
+                    done
+                    echo ""
+                    ;;
+                3)
+                    echo -e "\n=================================================="
+                    print_status "info" "Conflict Resolution Guide"
+                    echo -e "==================================================\n"
+                    echo "🎯 What is a merge conflict?"
+                    echo "   It happens when Git can't automatically merge changes because the same part of the same file was modified in different branches."
+                    echo -e "\n🔍 Understanding conflict markers:"
+                    echo "   <<<<<<< HEAD           # Start of your current branch's code"
+                    echo "   Your code..."
+                    echo "   ======="
+                    echo "   Their code..."
+                    echo "   >>>>>>> commit-hash    # End of the other branch's code"
+                    echo -e "\n✏️  Resolution Steps:"
+                    echo "   1. Open each file listed above."
+                    echo "   2. For each conflict, decide which code to keep (yours, theirs, a mix of both, or something new)."
+                    echo "   3. Delete all the '<<<<<<<', '=======', and '>>>>>>>' markers."
+                    echo "   4. Test your code to ensure it works."
+                    echo "   5. Save the file and run: git add <filename>"
+                    echo -e "\n💡 Editor Tips:"
+                    echo "   • VSCode: Highlights conflicts and provides 'Accept Current/Incoming/Both' buttons."
+                    echo "   • IntelliJ/JetBrains IDEs: Offer a powerful three-way merge view."
+                    echo ""
+                    read -p "Press Enter to return to the menu... " 
+                    ;;
+                4)
+                    if confirm_action "Are you sure you want to abort the rebase? This will revert to the state before rebase started." "n"; then
+                        git rebase --abort
+                        print_status "info" "Rebase aborted. Your branch has been restored."
+                        return 1
+                    fi
+                    ;;
+                *)
+                    print_status "warning" "Invalid option. Please try again."
+                    ;;
+            esac
+        else
+            # This case should ideally not be reached if the function is called correctly,
+            # but as a safeguard, we assume success if no conflicts are detected.
+            print_status "success" "No conflicts detected. Rebase complete!"
+            return 0
+        fi
+    done
+}
+
+# Perform submodule check and handling
+check_submodule() {
+    # If SUBMODULE_PATH is not set in the config, do nothing.
+    if [[ -z "$SUBMODULE_PATH" ]]; then
+        print_status "step" "Step 4/6: Checking submodule"
+        print_status "info" "No submodule path configured. Skipping."
+        return
+    fi
+    
+    local base_commit="$1"
+    
+    if [ -d "$SUBMODULE_PATH" ]; then
+        print_status "step" "Step 4/6: Checking '$SUBMODULE_PATH' submodule status"
+        print_status "check" "Verifying if submodule is consistent with '$BASE_BRANCH'..."
+        
+        local submodule_commit_on_base
+        submodule_commit_on_base=$(git ls-tree "$base_commit" "$SUBMODULE_PATH" | awk '{print $3}')
+        local submodule_commit_on_feature
+        submodule_commit_on_feature=$(git ls-tree HEAD "$SUBMODULE_PATH" | awk '{print $3}')
+
+        if [[ "$submodule_commit_on_base" != "$submodule_commit_on_feature" ]]; then
+            print_status "warning" "Submodule commit differs from '$BASE_BRANCH'!"
+            print_status "info" "$BASE_BRANCH branch commit: ${submodule_commit_on_base:0:7}"
+            print_status "info" "Current branch commit:  ${submodule_commit_on_feature:0:7}"
+            
+            if [[ -n "$SUBMODULE_CI_URL" ]]; then
+                echo ""
+                print_status "link" "You can check the submodule's commit history here: $SUBMODULE_CI_URL"
+            fi
+            echo ""
+
+            if confirm_action "Do you want to update the submodule to match '$BASE_BRANCH'?"; then
+                (
+                    cd "$SUBMODULE_PATH" && \
+                    git fetch origin && \
+                    git checkout "$submodule_commit_on_base"
+                )
+                git add "$SUBMODULE_PATH"
+                git commit --amend --no-edit
+                print_status "success" "Submodule updated and amended to the last commit."
+            else
+                print_status "warning" "You chose not to update the submodule. Please ensure this is intended."
+            fi
+        else
+            print_status "success" "Submodule is consistent with '$BASE_BRANCH'."
+        fi
+    else
+        print_status "step" "Step 4/6: Checking submodule"
+        print_status "info" "Submodule path '$SUBMODULE_PATH' not found. Skipping."
+    fi
+}
+
+# Perform the force push
+do_force_push() {
+    local feature_branch="$1"
+    
+    print_status "step" "Step 5/6: Pushing to remote"
+    echo "--------------------------------------------------"
+    print_status "warning" "Rebasing rewrites commit history, requiring a '--force' push."
+    print_status "warning" "Please confirm this is your personal feature branch and no one else is using it."
+    echo "--------------------------------------------------"
+    
+    if confirm_action "Force push to origin/$feature_branch?"; then
+        if git push origin "$feature_branch" --force-with-lease; then
+            print_status "success" "Branch successfully pushed to remote!"
+        else
+            print_status "error" "Push failed. Check your network, permissions, or if the remote branch was updated."
+            return 1
+        fi
+    else
+        print_status "info" "Push canceled by user."
+        return 1
+    fi
+    return 0
+}
+
+# --- Main Flow ---
+main() {
+    echo -e "\n🚀 Welcome to the Git Sync Assistant (git-sync)!\n=================================================="
+
+    # --- Step 0: Initial Checks & Resume Logic ---
+    check_git_repo
+
+    local feature_branch
+    feature_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+    if [ -z "$feature_branch" ]; then
+        print_status "error" "You are not on any branch (HEAD is detached). Please checkout a branch first."
+        exit 1
+    fi
+    
+    # Resume from an in-progress rebase
+    if check_rebase_in_progress; then
+        print_status "warning" "An in-progress rebase was detected."
+        if confirm_action "Do you want to continue resolving conflicts?"; then
+            if handle_rebase_conflicts; then
+                print_status "success" "Rebase conflicts resolved. Continuing sync process..."
+                local base_commit
+                base_commit=$(git rev-parse "origin/$BASE_BRANCH")
+                check_submodule "$base_commit"
+                echo ""
+                
+                if do_force_push "$feature_branch"; then
+                    echo ""
+                    print_status "step" "Step 6/6: Sync Complete"
+                    print_status "success" "Your branch is up to date. You can now create a Merge Request!"
+                    echo "=================================================="
+                fi
+                return 0
+            else
+                exit 1 # User aborted rebase
+            fi
+        else
+            print_status "info" "Exiting. You can run 'git rebase --abort' to cancel the rebase."
+            exit 0
+        fi
+    fi
+
+    # --- Step 1: Environment Prep ---
+    print_status "step" "Step 1/6: Preparing environment"
+    if [[ "$feature_branch" == "$BASE_BRANCH" ]]; then
+        print_status "error" "You are on the '$BASE_BRANCH' branch. Please switch to your feature branch."
+        exit 1
+    fi
+    print_status "success" "Current feature branch: $feature_branch"
+
+    if ! git diff-index --quiet HEAD --; then
+        print_status "warning" "Uncommitted changes detected."
+        if confirm_action "Commit these changes and continue?"; then
+            git add .
+            read -p "Enter a commit message: " commit_message
+            git commit -m "$commit_message"
+            print_status "success" "Changes committed."
+        else
+            print_status "error" "Please handle uncommitted changes before running the script."
+            exit 1
+        fi
+    else
+        print_status "success" "Working directory is clean."
+    fi
+    echo ""
+
+    # --- Step 2: Update Base Branch ---
+    print_status "step" "Step 2/6: Updating '$BASE_BRANCH' branch"
+    print_status "info" "Switching to '$BASE_BRANCH' and pulling latest changes..."
+    
+    if ! git checkout "$BASE_BRANCH" >/dev/null 2>&1; then
+        print_status "error" "Could not switch to '$BASE_BRANCH'."
+        exit 1
+    fi
+    
+    if ! git pull origin "$BASE_BRANCH"; then
+        print_status "error" "Failed to pull '$BASE_BRANCH'. Check network or resolve conflicts."
+        git checkout "$feature_branch" # Switch back safely
+        exit 1
+    fi
+    print_status "success" "'$BASE_BRANCH' is now up-to-date."
+    
+    local base_commit
+    base_commit=$(git rev-parse HEAD)
+    
+    print_status "info" "Switching back to '$feature_branch'..."
+    if ! git checkout "$feature_branch" >/dev/null 2>&1; then
+        print_status "error" "Could not switch back to '$feature_branch'."
+        exit 1
+    fi
+    echo ""
+
+    # --- Step 3: Perform Rebase ---
+    print_status "step" "Step 3/6: Performing rebase"
+    print_status "info" "Rebasing latest changes from '$BASE_BRANCH' onto '$feature_branch'..."
+    
+    if ! git rebase "$BASE_BRANCH"; then
+        if ! handle_rebase_conflicts; then
+            exit 1 # User aborted rebase
+        fi
+    else
+        print_status "success" "Rebase completed successfully!"
+    fi
+    echo ""
+
+    # --- Step 4: Check Submodule ---
+    check_submodule "$base_commit"
+    echo ""
+
+    # --- Step 5: Push ---
+    if ! do_force_push "$feature_branch"; then
+        exit 1
+    fi
+    echo ""
+
+    # --- Step 6: Finish ---
+    print_status "step" "Step 6/6: Sync Complete"
+    print_status "success" "Your branch is up to date. You can now create a Merge Request!"
+    echo "=================================================="
+}
+
+# Pass all arguments to the main function
+main "$@"

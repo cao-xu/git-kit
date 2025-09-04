@@ -1,0 +1,67 @@
+# Git-Kit Configuration File (.git-kit-config)
+# ----------------------------------------------
+# INSTRUCTIONS:
+# 1. Place this file, renamed to ".git-kit-config", in your project's root directory.
+# 2. Customize the values below for your project.
+# 3. Add ".git-kit-config" to your global .gitignore to prevent committing it.
+
+[git-sync]
+# The main branch to sync with (e.g., "develop", "main").
+base_branch = "develop"
+
+# (Optional) Path to a git submodule if your project uses one.
+submodule_path = ""
+
+# (Optional) A web URL to view the submodule's commit history.
+submodule_ci_url = ""
+
+
+[gitmr]
+# (Optional) A default link (e.g., to a Jira/Trello board) to be copied.
+task_management_url = "https://your-org.atlassian.net/browse/PROJ"
+
+# A list of common target branches for Merge/Pull Requests.
+target_branches = (
+    "develop"
+    "master"
+    "release"
+    "staging"
+    "test"
+)
+
+
+[gitmr-release]
+# The fixed source branch for creating a release MR/PR.
+release_source_branch = "develop"
+
+# The fixed target branch for creating a release MR/PR.
+release_target_branch = "master"
+
+
+# ==============================================================================
+#  PROJECT DEFINITIONS
+# ==============================================================================
+#
+# Define your projects here. Used by 'gitmr' and 'gitmr-release'.
+#
+# FORMAT:
+# "Your Project Nickname" = "PROJECT_ID,GIT_REPO_PATH"
+#
+# - Your Project Nickname: A short, user-friendly name for the selection menu.
+# - PROJECT_ID: The unique ID from your Git hosting platform (e.g., GitLab/Gitea Project ID).
+# - GIT_REPO_PATH: The path part of the repo URL (e.g., "your-org/your-repo").
+#
+# The script will automatically detect the Git Host URL (like https://github.com)
+# from your remote 'origin' URL.
+#
+[projects]
+# Example for a GitHub project:
+# "My Awesome App" = "12345678,my-org/awesome-app"
+#
+# Example for a GitLab project:
+# "Backend Service" = "87654321,my-group/backend-service"
+
+projects = (
+    "My-API-Server=10001,my-org/api-server"
+    "My-Executor-Service=10002,my-org/executor-service"
+)
