@@ -104,8 +104,8 @@ release_source_branch = "develop"
 # Format: Nickname = "ProjectID,RepoPath"
 # RepoPath should match the path part of your git remote URL (e.g., group/project-name)
 projects = (
-  "My-API-Server" = "12345,my-group/my-api-server"
-  "My-Frontend"   = "67890,my-group/my-frontend-app"
+  "My-API-Server=12345,my-group/my-api-server"
+  "My-Frontend=67890,my-group/my-frontend-app"
 )
 
 # [Target Branches for gitmr]
