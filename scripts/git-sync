@@ -30,8 +30,12 @@ fi
 get_config_value() {
     local key="$1"
     if [[ -z "$CONFIG_FILE" ]]; then return; fi
-    # Simple parser for the INI-like format. Gets a single value.
-    grep -E "^\s*${key}\s*=" "$CONFIG_FILE" | sed -E "s/^\s*${key}\s*=\s*//;s/\"//g" | tr -d '\r' | head -n 1
+
+    # AWK is the most reliable tool for this job.
+    # -F'[= ]+'  : Sets the field separator to one or more '=' or ' ' characters.
+    # $1 ~ key   : Checks if the first field matches the provided key.
+    # {print $NF} : Prints the last field on that line.
+    awk -F'[= ]+' -v key="^${key}$" '$1 ~ key {print $NF}' "$CONFIG_FILE" | tr -d '"'
 }
 
 # Load configurations for this script
@@ -425,14 +429,27 @@ main() {
     # --- Step 3: Perform Rebase ---
     print_status "step" "Step 3/6: Performing rebase"
     print_status "info" "Rebasing latest changes from '$BASE_BRANCH' onto '$feature_branch'..."
-    
-    if ! git rebase "$BASE_BRANCH"; then
+
+    # 使用 GIT_EDITOR=true 来防止 rebase 命令在某些情况下（比如合并提交）尝试打开交互式编辑器。
+    # 这样可以确保脚本在非交互式模式下顺利运行。
+    if ! GIT_EDITOR=true git rebase "$BASE_BRANCH"; then
+        # 如果初始 rebase 失败（通常是因为冲突），则进入冲突处理流程。
         if ! handle_rebase_conflicts; then
-            exit 1 # User aborted rebase
+            # 如果 handle_rebase_conflicts 返回失败（用户选择了中止），则退出脚本。
+            exit 1 
         fi
-    else
-        print_status "success" "Rebase completed successfully!"
+        
+        # 关键修复：在处理完冲突后，必须再次检查 rebase 是否真的已经完成。
+        # check_rebase_in_progress 函数会检查 .git/rebase-merge 目录是否存在。
+        if check_rebase_in_progress; then
+            print_error "Rebase is still in progress. This can happen if 'git rebase --continue' needs to be run again or if there are other issues."
+            print_error "Please run 'git status' and resolve the situation manually. To cancel, run 'git rebase --abort'."
+            exit 1
+        fi
     fi
+
+    # 只有在 rebase 过程完全结束后，才打印最终的成功消息。
+    print_status "success" "Rebase completed successfully!"
     echo ""
 
     # --- Step 4: Check Submodule ---
